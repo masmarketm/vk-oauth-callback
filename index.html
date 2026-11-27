@@ -3,10 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Проверка авторизации VK — VK Auto Posting</title>
+  <title>VK Auto Posting — авторизация</title>
   <style>
     :root { color-scheme: light; font-family: system-ui, -apple-system, Segoe UI, sans-serif; }
-    body { margin: 0; background: #f4f6fa; color: #182230; }
+    body { margin: 0; padding: 20px; background: #f4f6fa; color: #182230; }
     main { max-width: 680px; margin: 7vh auto; padding: 28px; background: white; border: 1px solid #e3e8ef; border-radius: 18px; box-shadow: 0 12px 36px #14243a12; }
     h1 { margin: 0 0 8px; font-size: 24px; }
     p { line-height: 1.55; color: #526173; }
@@ -15,48 +15,64 @@
     #status.err { background: #fff0ef; color: #9b2922; }
     #login { min-height: 48px; }
     .note { font-size: 13px; color: #6b7787; }
-    code { background: #f0f3f7; padding: 2px 5px; border-radius: 4px; }
   </style>
   <script src="https://unpkg.com/@vkid/sdk@2.6.2/dist-sdk/umd/index.js"></script>
 </head>
 <body>
 <main>
-  <h1>Проверка VK Auto Posting</h1>
-  <p>Тестируем только авторизацию и доступ к методу загрузки фотографий. Фотографии не загружаются и публикации не создаются.</p>
+  <h1>VK Auto Posting</h1>
+  <p>Подключение VK ID к серверу автоматизации. На этом этапе мы только проверяем авторизацию и сохраняем токены на сервере. Публикаций и загрузки фотографий не будет.</p>
+  <div id="status" role="status">Подготавливаю безопасную авторизацию…</div>
   <div id="login"></div>
-  <div id="status" role="status">Загрузка компонента VK ID…</div>
-  <p class="note">Токены не выводятся на экран, не записываются в localStorage и не отправляются в GitHub. После проверки закрой эту страницу.</p>
+  <p class="note">Токены не отображаются на странице и не сохраняются в браузере или GitHub.</p>
 </main>
 <script>
-(() => {
+(async () => {
   const APP_ID = 54919663;
   const REDIRECT_URL = 'https://masmarketm.github.io/vk-oauth-callback/';
-  const GROUP_ID = 242033281;
-  const API_VERSION = '5.199';
+  const WORKER_URL = 'https://vk-autopost-backend.ma-smarket-m.workers.dev';
   const status = document.getElementById('status');
+  const login = document.getElementById('login');
 
   function show(message, kind) {
     status.textContent = message;
     status.className = kind || '';
   }
 
-  function apiError(data) {
-    if (data && data.error) {
-      return 'VK API вернул ошибку ' + data.error.error_code + ': ' + data.error.error_msg;
+  async function worker(path, options = {}) {
+    const response = await fetch(WORKER_URL + path, {
+      ...options,
+      mode: 'cors',
+      credentials: 'omit',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(options.headers || {})
+      }
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      throw new Error(data.details || data.error || 'Ошибка серверного запроса');
     }
-    return 'VK API вернул неожиданный ответ.';
+    return data;
   }
 
-  if (!window.VKIDSDK) {
-    show('Не удалось загрузить SDK VK ID. Обнови страницу позже.', 'err');
-    return;
-  }
-
-  const VKID = window.VKIDSDK;
   try {
+    if (!window.VKIDSDK) {
+      throw new Error('Не удалось загрузить SDK VK ID. Обнови страницу позже.');
+    }
+
+    // Worker создаёт state и PKCE-пару; verifier остаётся только на сервере.
+    const session = await worker('/auth/start', { method: 'POST', body: '{}' });
+    if (!session.success || !session.state || !session.codeChallenge) {
+      throw new Error('Сервер не подготовил сессию авторизации.');
+    }
+
+    const VKID = window.VKIDSDK;
     VKID.Config.init({
       app: APP_ID,
       redirectUrl: REDIRECT_URL,
+      state: session.state,
+      codeChallenge: session.codeChallenge,
       responseMode: VKID.ConfigResponseMode.Callback,
       source: VKID.ConfigSource.LOWCODE,
       scope: ''
@@ -64,7 +80,7 @@
 
     const oneTap = new VKID.OneTap();
     oneTap.render({
-      container: document.getElementById('login'),
+      container: login,
       showAlternativeLogin: true
     })
     .on(VKID.WidgetEvents.ERROR, (error) => {
@@ -72,43 +88,43 @@
       show('Ошибка виджета VK ID. Проверь настройки приложения и Redirect URL.', 'err');
     })
     .on(VKID.OneTapInternalEvents.LOGIN_SUCCESS, async (payload) => {
-      show('Вход выполнен. Проверяю, выдаёт ли VK доступ к загрузке фотографий…');
       try {
-        const tokenData = await VKID.Auth.exchangeCode(payload.code, payload.device_id);
-        if (!tokenData || !tokenData.access_token) {
-          throw new Error('VK ID не вернул access_token.');
+        if (!payload || !payload.code || !payload.device_id) {
+          throw new Error('VK ID не передал необходимые данные авторизации.');
         }
 
-        const params = new URLSearchParams({
-          group_id: String(GROUP_ID),
-          access_token: tokenData.access_token,
-          v: API_VERSION
+        show('Вход выполнен. Передаю код авторизации на сервер…');
+
+        const result = await worker('/auth/exchange', {
+          method: 'POST',
+          body: JSON.stringify({
+            code: payload.code,
+            device_id: payload.device_id,
+            state: session.state
+          })
         });
-        const response = await fetch('https://api.vk.com/method/photos.getWallUploadServer?' + params.toString(), {
-          method: 'GET',
-          mode: 'cors',
-          credentials: 'omit'
-        });
 
-        if (!response.ok) {
-          throw new Error('Не удалось обратиться к VK API (HTTP ' + response.status + ').');
+        if (!result.success) {
+          throw new Error(result.error || 'Не удалось сохранить авторизацию.');
         }
 
-        const result = await response.json();
-        if (result.response && result.response.upload_url) {
-          show('УСПЕХ: VK API принял пользовательский токен для photos.getWallUploadServer.\n\nФотография не загружалась; публикация не создавалась. Можно переходить к безопасному серверному хранению и обновлению токенов.', 'ok');
-        } else {
-          show('Авторизация VK ID прошла, но проверка загрузки фото не пройдена.\n\n' + apiError(result) + '\n\nТокен не сохранён. Пришли мне скриншот результата, скрыв любые личные данные.', 'err');
+        const check = await worker('/auth/status');
+        if (!check.authorized) {
+          throw new Error('Сервер не подтвердил сохранение авторизации.');
         }
+
+        show('УСПЕХ: VK ID авторизован, токены сохранены на сервере.\n\nНичего не опубликовано и фотографии не загружались.', 'ok');
+        login.textContent = '';
       } catch (error) {
-        console.error('VK auth/API test failed', error);
-        show('Проверка не завершилась: ' + (error && error.message ? error.message : 'неизвестная ошибка') + '\n\nТокен не сохранялся. Пришли скриншот результата; не копируй токены из инструментов разработчика.', 'err');
+        console.error('VK server exchange failed', error);
+        show('Не удалось завершить авторизацию: ' + (error.message || 'неизвестная ошибка') + '\n\nТокены на страницу не выводились. Пришли скриншот сообщения.', 'err');
       }
     });
-    show('Готово. Нажми кнопку VK ID, чтобы выполнить тестовую авторизацию.');
+
+    show('Сервер готов. Нажми кнопку VK ID для входа.');
   } catch (error) {
-    console.error(error);
-    show('Не удалось инициализировать VK ID: ' + (error && error.message ? error.message : 'ошибка конфигурации'), 'err');
+    console.error('Authorization setup failed', error);
+    show('Не удалось подготовить авторизацию: ' + (error.message || 'неизвестная ошибка'), 'err');
   }
 })();
 </script>
